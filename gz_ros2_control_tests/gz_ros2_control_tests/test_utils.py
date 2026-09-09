@@ -17,62 +17,164 @@ import rclpy
 from sensor_msgs.msg import JointState
 
 
-def wait_for_pendulum_steady_state(
-    node,
-    joint_name='cart_to_pendulum',
-    vel_eps=0.05,
-    eff_eps=0.05,
-    timeout_ns=int(10e9),
-    stable_required=5
-):
-    """
-    Wait until the pendulum joint reaches steady-state.
+def read_joint_state(node, joint_name, timeout=10.0):
+    joint_state = None
 
-    Startup is not deterministic unless the initial value is captured
-    before physics. See issue #836 for reference.
-    """
-    last_msg = None
+    def callback(message):
+        nonlocal joint_state
 
-    def callback(msg):
-        nonlocal last_msg
-        last_msg = msg
+        if joint_name not in message.name:
+            return
 
-    sub = node.create_subscription(
+        index = message.name.index(joint_name)
+
+        if (
+            index >= len(message.position)
+            or index >= len(message.velocity)
+            or index >= len(message.effort)
+        ):
+            return
+
+        joint_state = (
+            message.position[index],
+            message.velocity[index],
+            message.effort[index],
+        )
+
+    subscription = node.create_subscription(
         JointState,
         '/joint_states',
         callback,
-        10
+        10,
     )
+
+    end_time = node.get_clock().now().nanoseconds + int(timeout * 1e9)
+
+    try:
+        while joint_state is None and node.get_clock().now().nanoseconds < end_time:
+            rclpy.spin_once(node, timeout_sec=0.1)
+    finally:
+        node.destroy_subscription(subscription)
+
+    if joint_state is None:
+        raise AssertionError(
+            f"No complete joint state was received for '{joint_name}'."
+        )
+
+    return joint_state
+
+
+def observe_joint_state_window(
+    node,
+    joint_name,
+    duration=5.0,
+    sample_period=0.1,
+    stop_when=None,
+):
+    samples = []
+
+    def callback(message):
+        if joint_name not in message.name:
+            return
+
+        index = message.name.index(joint_name)
+
+        if (
+            index >= len(message.position)
+            or index >= len(message.velocity)
+            or index >= len(message.effort)
+        ):
+            return
+
+        samples.append((
+            message.position[index],
+            message.velocity[index],
+            message.effort[index],
+        ))
+
+        if stop_when is not None and stop_when(samples):
+            raise RuntimeError("stop condition reached")
+
+    subscription = node.create_subscription(
+        JointState,
+        '/joint_states',
+        callback,
+        10,
+    )
+
+    end_time = node.get_clock().now().nanoseconds + int(duration * 1e9)
+
+    try:
+        while node.get_clock().now().nanoseconds < end_time:
+            rclpy.spin_once(node, timeout_sec=sample_period)
+    except RuntimeError:
+        pass
+    finally:
+        node.destroy_subscription(subscription)
+
+    if not samples:
+        raise AssertionError(
+            f"No joint state samples were received for '{joint_name}' "
+            f"during the {duration}s observation window."
+        )
+
+    return samples
+
+
+def wait_for_pendulum_steady_state(
+    node,
+    vel_eps=0.05,
+    eff_eps=0.05,
+    timeout_ns=int(10e9),
+    stable_required=5,
+):
+    joint_name = 'cart_to_pendulum'
 
     start = node.get_clock().now().nanoseconds
     stable_count = 0
 
-    pos = None
-    vel = None
-    eff = None
+    def stop_when(samples):
+        nonlocal stable_count
 
-    while node.get_clock().now().nanoseconds - start < timeout_ns:
-        rclpy.spin_once(node, timeout_sec=0.1)
+        if not samples:
+            return False
 
-        if last_msg is None:
-            continue
+        _, vel, eff = samples[-1]
 
-        if joint_name not in last_msg.name:
-            continue
-
-        idx = last_msg.name.index(joint_name)
-        vel = last_msg.velocity[idx]
-        eff = last_msg.effort[idx]
-        pos = last_msg.position[idx]
-
-        # Convergence condition with hysteresis
         if abs(vel) < vel_eps and abs(eff) < eff_eps:
             stable_count += 1
-            if stable_count >= stable_required:
-                node.destroy_subscription(sub)
-                return pos, vel, eff
-        else:
-            stable_count = 0
+            return stable_count >= stable_required
 
-    node.destroy_subscription(sub)
+        stable_count = 0
+        return False
+
+    while node.get_clock().now().nanoseconds - start < timeout_ns:
+        samples = observe_joint_state_window(
+            node,
+            joint_name,
+            duration=0.5,
+            sample_period=0.01,
+            stop_when=stop_when,
+        )
+
+        if samples and abs(samples[-1][1]) < vel_eps and abs(samples[-1][2]) < eff_eps:
+            if stable_count >= stable_required:
+                return samples[-1]
+
     raise AssertionError('Pendulum did not converge within timeout')
+
+
+def assert_joint_initial_position(node, joint_name, expected_position):
+    actual_position, _, _ = read_joint_state(node, joint_name)
+
+    if abs(actual_position - expected_position) > 0.01:
+        raise AssertionError(
+                f"Initial position mismatch for '{joint_name}': "
+                f"expected {expected_position}, "
+                f"got {actual_position}"
+        )
+
+    print(
+        f"Initial position for '{joint_name}' asserted: "
+        f"{actual_position:.4f} ~= {expected_position:.4f}"
+    )
